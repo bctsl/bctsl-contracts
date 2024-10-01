@@ -1,0 +1,105 @@
+// ISC License
+//
+// Copyright (c) 2024, BCTSL
+//
+// Permission to use, copy, modify, and/or distribute this software for any
+// purpose with or without fee is hereby granted, provided that the above
+// copyright notice and this permission notice appear in all copies.
+//
+// THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+// REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
+// AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+// INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
+// LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE
+// OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+// PERFORMANCE OF THIS SOFTWARE.
+
+// THIS IS NOT SECURITY AUDITED
+// DO NEVER USE THIS WITHOUT SECURITY AUDIT FIRST
+
+// Under no circumstances, whether in tort (including negligence), contract, or otherwise,
+// unless required by applicable law, shall BCTSL be liable for damages,
+// including any direct, indirect, special, incidental,
+// or consequential damages of any nature arising out of the deployment or use of this smart contract,
+// notwithstanding that BCTSL may have been advised of the possibility of such damages.
+
+@compiler >= 7
+
+include "Set.aes"
+
+contract CommunityManagement =
+
+  type meta_info = map(string, string)
+
+  datatype event = ChangeMinimumTokenThreshold(int)
+                 | AddModerator(address)
+                 | DeleteModerator(address)
+                 | MuteUserId(string)
+                 | UnmuteUserId(string)
+                 | SetOwner(address)
+                 | ChangedMetaInfo
+
+  record state =
+    { owner: address
+    , minimum_token_threshold : int
+    , is_private : bool
+    , moderator_accounts : Set.set(address)
+    , muted_user_ids : Set.set(string)
+    , meta_info : meta_info }
+
+  stateful entrypoint init(initial_moderator : address, minimum_token_threshold : int, is_private : bool, meta_info : meta_info) =
+    { owner = Call.caller,
+      minimum_token_threshold = minimum_token_threshold,
+      is_private = is_private,
+      moderator_accounts = Set.from_list([initial_moderator]),
+      muted_user_ids = Set.new(),
+      meta_info = meta_info }
+
+  entrypoint get_state() : state = state
+  entrypoint moderator_accounts() : Set.set(address) = state.moderator_accounts
+  entrypoint muted_user_ids() : Set.set(string) = state.muted_user_ids
+  entrypoint minimum_token_threshold() : int = state.minimum_token_threshold
+  entrypoint owner() : address = state.owner
+  entrypoint meta_info() : meta_info = state.meta_info
+  entrypoint version() : int = 1
+
+  stateful entrypoint change_minimum_token_threshold(minimum_token_threshold : int) =
+    require_owner()
+    Chain.event(ChangeMinimumTokenThreshold(minimum_token_threshold))
+    put(state{ minimum_token_threshold = minimum_token_threshold })
+
+  stateful entrypoint add_moderator(moderator : address) =
+    require_owner()
+    Chain.event(AddModerator(moderator))
+    put(state{ moderator_accounts = Set.insert(moderator, state.moderator_accounts) })
+
+  stateful entrypoint delete_moderator(moderator : address) =
+    require_owner()
+    Chain.event(DeleteModerator(moderator))
+    put(state{ moderator_accounts = Set.delete(moderator, state.moderator_accounts) })
+
+  stateful entrypoint mute_user_id(user_id : string) =
+    require_moderator()
+    Chain.event(MuteUserId(user_id))
+    put(state{ muted_user_ids = Set.insert(user_id, state.muted_user_ids) })
+
+  stateful entrypoint unmute_user_id(user_id : string) =
+    require_moderator()
+    Chain.event(UnmuteUserId(user_id))
+    put(state{ muted_user_ids = Set.delete(user_id, state.muted_user_ids) })
+
+  stateful entrypoint change_meta_info(meta_info : meta_info) =
+    require_owner()
+    Chain.event(ChangedMetaInfo)
+    put(state{ meta_info = meta_info })
+
+  stateful entrypoint set_owner(owner : address) =
+    require_owner()
+    Chain.event(SetOwner(owner))
+    put(state{ owner = owner })
+
+  function require_owner() =
+    require(Call.caller == state.owner, "ONLY_OWNER_CAN_CHANGE")
+
+  function require_moderator() =
+    require(Set.member(Call.caller, state.moderator_accounts), "ONLY_MODERATOR_CAN_CHANGE")

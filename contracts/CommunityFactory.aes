@@ -1,0 +1,164 @@
+// ISC License
+//
+// Copyright (c) 2024, BCTSL
+//
+// Permission to use, copy, modify, and/or distribute this software for any
+// purpose with or without fee is hereby granted, provided that the above
+// copyright notice and this permission notice appear in all copies.
+//
+// THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+// REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
+// AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+// INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
+// LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE
+// OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+// PERFORMANCE OF THIS SOFTWARE.
+
+// THIS IS NOT SECURITY AUDITED
+// DO NEVER USE THIS WITHOUT SECURITY AUDIT FIRST
+
+// Under no circumstances, whether in tort (including negligence), contract, or otherwise,
+// unless required by applicable law, shall BCTSL be liable for damages,
+// including any direct, indirect, special, incidental,
+// or consequential damages of any nature arising out of the deployment or use of this smart contract,
+// notwithstanding that BCTSL may have been advised of the possibility of such damages.
+
+@compiler >= 7
+
+include "./interfaces/TokenSale.aes"
+include "./CommunityManagement.aes"
+include "./DAO.aes"
+include "./AffiliationBondingCurveTokenSale.aes"
+include "./AffiliationTreasury.aes"
+include "./BondingCurveExponential.aes"
+
+include "List.aes"
+
+main contract CommunityFactory =
+
+  type token_sale_registry = map(string, TokenSale)
+  type known_token_sales = Set.set(address)
+
+  // later requirements that would need an update of community management could replace the factory with a new one and migrate state
+  type community_management = map(TokenSale, CommunityManagement)
+
+  record collection_data =
+    { allowed_name_chars: list(allowedNameChars),
+      allowed_name_length: int,
+      token_sale_registry: token_sale_registry}
+
+  type collection_registry = map(string, collection_data)
+
+  datatype event = CreateCommunity(string, DAO, TokenSale, CommunityManagement)
+                 | CreateCollection(string, address)
+  datatype allowedNameChars = SingleChar(int) | CharRangeFromTo(int, int)
+
+  // mints protocol DAO tokens at a rate of 1000 times the buy value.
+  let protocol_dao_token_multiplier = 1000
+
+  record state =
+    { collection_registry: collection_registry
+    , known_token_sales : known_token_sales // for lookup performance
+    , community_management : community_management
+    , affiliation_treasury : AffiliationTreasury
+    , bonding_curve : BondingCurve
+    // the protocol DAO token that can be staked to vote on signaling polls in the future.
+    // these tokens are issued based on the buy transaction amount.
+    , protocol_dao_token : FungibleTokenFull }
+
+  stateful entrypoint init(protocol_token_name : string) : state =
+    { collection_registry = {},
+      known_token_sales = Set.new(),
+      community_management = {},
+      affiliation_treasury = Chain.create() : AffiliationTreasury,
+      bonding_curve = (Chain.create() : BondingCurveExponential) : BondingCurve,
+      protocol_dao_token = Chain.create(protocol_token_name, 18, protocol_token_name, None) : FungibleTokenFull }
+
+  entrypoint get_state() : state = state
+  entrypoint allowed_name_length(collection_name : string) : int =
+    let collection = require_collection(collection_name)
+    collection.allowed_name_length
+  entrypoint allowed_name_chars(collection_name : string) : list(allowedNameChars) =
+    let collection = require_collection(collection_name)
+    collection.allowed_name_chars
+  entrypoint token_sale_registry(collection_name : string) : token_sale_registry =
+    let collection = require_collection(collection_name)
+    collection.token_sale_registry
+  entrypoint community_management() : community_management = state.community_management
+  entrypoint affiliation_treasury() : AffiliationTreasury = state.affiliation_treasury
+  entrypoint fee_percentage() : int = state.affiliation_treasury.get_affiliation_fee_percentage()
+  entrypoint fee_precision() : int = state.affiliation_treasury.get_affiliation_fee_precision()
+  entrypoint bonding_curve() : BondingCurve = state.bonding_curve
+  entrypoint get_community_management(token_sale : TokenSale) : CommunityManagement = state.community_management[token_sale]
+  entrypoint get_token_sale(collection_name : string, name : string) : TokenSale =
+    let collection = require_collection(collection_name)
+    collection.token_sale_registry[name]
+  entrypoint token_contract(collection_name : string, name : string) : FungibleTokenFull =
+    let collection = require_collection(collection_name)
+    collection.token_sale_registry[name].token_contract()
+  entrypoint has_community(collection_name : string, name : string) : bool =
+    let collection = require_collection(collection_name)
+    Map.member(name, collection.token_sale_registry)
+  entrypoint factory_type() : string = "AFFILIATION_COMMUNITY_FACTORY"
+  entrypoint protocol_dao_token() : FungibleTokenFull = state.protocol_dao_token
+  entrypoint version() : int = 1
+
+  stateful entrypoint mint_protocol_dao_token(buy_value : int, receiver : address) =
+    require(Set.member(Call.caller, state.known_token_sales), "NOT_KNOWN_TOKEN_SALE")
+    state.protocol_dao_token.mint(receiver, buy_value * protocol_dao_token_multiplier)
+
+  payable stateful entrypoint create_collection(collection_name : string, allowed_name_length : int, allowed_name_chars : list(allowedNameChars)) =
+    require(!Map.member(collection_name, state.collection_registry), "collection_ALREADY_EXISTS")
+    require(Call.value == 555 * (10 ^ 18), "COLLECTION_CREATION_DONATION_MISMATCH")
+    let collection_name = String.concat(String.concat(collection_name, "-"), Address.to_str(Call.caller))
+    put(state{ collection_registry[collection_name] =
+      {allowed_name_chars = allowed_name_chars, allowed_name_length = allowed_name_length, token_sale_registry = {}} })
+    Chain.spend(ak_11111111111111111111111111111111273Yts, Call.value)
+    Chain.event(CreateCollection(collection_name, Call.caller))
+    collection_name
+
+  payable stateful entrypoint create_community(collection_name : string, name : string, initial_buy_count : int, is_private : bool, meta_info : CommunityManagement.meta_info) =
+    let collection = require_collection(collection_name)
+    require_name_unique(name, collection.token_sale_registry)
+    require_name_restrictions(name, collection.allowed_name_length, collection.allowed_name_chars)
+    let community_management = Chain.create(Call.caller, 10 ^ decimals(), is_private, meta_info) : CommunityManagement
+    let dao = Chain.create(None, Contract.address) : DAO
+    let bonding_curve_token_sale = Chain.create(dao.address, name, decimals(), name, state.bonding_curve, Some(dao.address), state.affiliation_treasury) : AffiliationBondingCurveTokenSale
+    dao.set_token_sale(bonding_curve_token_sale)
+    community_management.set_owner(dao.address)
+    if(initial_buy_count > 0)
+      let buy_price = bonding_curve_token_sale.price(initial_buy_count)
+      require(Call.value >= buy_price, "VALUE_HAS_TO_BE_GREATER_THAN_BUY_PRICE")
+      let overpaid_refund = Call.value - buy_price
+      if (overpaid_refund > 0) Chain.spend(Call.caller, overpaid_refund) else ()
+      bonding_curve_token_sale.buy_with_affiliation(value = Call.value - overpaid_refund, initial_buy_count, Call.caller)
+      bonding_curve_token_sale.token_contract().transfer(Call.caller, initial_buy_count)
+      state.protocol_dao_token.mint(Call.caller, (Call.value - overpaid_refund) * protocol_dao_token_multiplier)
+    else ()
+    put(state{ collection_registry[collection_name].token_sale_registry[name] = bonding_curve_token_sale,
+               known_token_sales = Set.insert(bonding_curve_token_sale.address, state.known_token_sales),
+               community_management[bonding_curve_token_sale] = community_management })
+    Chain.event(CreateCommunity(name, dao, bonding_curve_token_sale, community_management))
+    (dao, bonding_curve_token_sale, community_management)
+
+  function require_collection(collection_name : string) : collection_data =
+    switch(Map.lookup(collection_name, state.collection_registry))
+      None => abort("COLLECTION_NOT_FOUND")
+      Some(collection) => collection
+
+  function decimals() = 18
+
+  function require_name_unique(name : string, token_sale_registry : token_sale_registry) =
+    require(!Map.member(name, token_sale_registry), "NAME_ALREADY_REGISTERED")
+
+  function
+    allowed_char_range : (list(allowedNameChars), int) => bool
+    allowed_char_range(SingleChar(single_value) :: next_ranges, char_int) = if(char_int == single_value) true else allowed_char_range(next_ranges, char_int)
+    allowed_char_range(CharRangeFromTo(range_start, range_end) :: next_ranges, char_int) = if(char_int >= range_start && char_int =< range_end) true else allowed_char_range(next_ranges, char_int)
+    allowed_char_range(_, char_int) = false
+
+  function require_name_restrictions(name : string, allowed_name_length : int, allowed_name_chars : list(allowedNameChars)) =
+    require(String.length(name) =< allowed_name_length, "NAME_TOO_LONG")
+    let is_allowed_char = (c : char) =>
+      allowed_char_range(allowed_name_chars, Char.to_int(c))
+    require(List.all(is_allowed_char, String.to_list(name)), "NAME_NOT_ALLOWED_CHAR")

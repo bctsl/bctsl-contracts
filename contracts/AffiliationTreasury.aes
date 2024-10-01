@@ -1,0 +1,175 @@
+// ISC License
+//
+// Copyright (c) 2024, BCTSL
+//
+// Permission to use, copy, modify, and/or distribute this software for any
+// purpose with or without fee is hereby granted, provided that the above
+// copyright notice and this permission notice appear in all copies.
+//
+// THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+// REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
+// AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+// INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
+// LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE
+// OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+// PERFORMANCE OF THIS SOFTWARE.
+
+// THIS IS NOT SECURITY AUDITED
+// DO NEVER USE THIS WITHOUT SECURITY AUDIT FIRST
+
+// Under no circumstances, whether in tort (including negligence), contract, or otherwise,
+// unless required by applicable law, shall BCTSL be liable for damages,
+// including any direct, indirect, special, incidental,
+// or consequential damages of any nature arising out of the deployment or use of this smart contract,
+// notwithstanding that BCTSL may have been advised of the possibility of such damages.
+
+@compiler >= 7
+
+include "Set.aes"
+
+payable contract AffiliationTreasury =
+
+  let affiliation_fee_precision = 1 * 10 ^ 5
+  let affiliation_fee_percentages = [300, 125, 50, 25]
+  let unique_invitee_buy_amount_threshold = 10 * 10 ^ 18
+  let unique_invitee_count_threshold = 4
+  let payout_period_interval = 2592000000 // 1000ms * 60s * 60m * 24h * 30d
+
+  datatype event = UserInvited(address, address) // invitee, inviter
+                 | RewardAdded(address, int) // user, addded amount
+                 | Withdrawn(address, int) // user, reward amount
+                 | InvitationRegistered(address, address, int) // caller, invitation_address, amount
+                 | InvitationRedeemed(address, address, address) // invitee_address, inviter_address, caller
+                 | InvitationRevoked(address, address) // invitation_address, inviter_address
+                 | RecordSaleTransaction(address, int) // buyer, amount
+
+  // tuple first set is addresses that reached the 10 AE buy amount, second maps incremental buy amount achieved
+  datatype unique_invitees_state() = ThresholdReached | WaitingForInvitations(Set.set(address), map(address, int))
+
+  record state =
+    { payout_periods: map(int, map(address, int))
+    , affiliation_tree: map(address, address) // referral tracking (invitee, inviter)
+    , invitation_codes: map(address, (address * int * bool)) // an invitation code is just a temporary address, pair (inviter, additional_amount, is_redeemed)
+    , unique_invitees: map(address, unique_invitees_state) }
+
+  entrypoint init() : state =
+    { payout_periods = {},
+      affiliation_tree = {},
+      invitation_codes = {},
+      unique_invitees = {} }
+
+  entrypoint get_direct_inviter(account: address): option(address) = Map.lookup(account, state.affiliation_tree)
+
+  entrypoint get_affiliation_fee_percentage(): int = 500 // 0,5% = hardcoded for performance, sum of affiliation_fee_percentages
+
+  entrypoint get_accumulated_rewards(account: address): int =
+    state.payout_periods[get_payout_period() = {}][account = 0]
+     + state.payout_periods[get_payout_period() - 1 = {}][account = 0]
+
+  entrypoint get_affiliation_fee_precision() = affiliation_fee_precision
+  entrypoint get_affiliation_fee_percentages() = affiliation_fee_percentages
+  entrypoint payout_periods() = state.payout_periods
+  entrypoint unique_invitees() = state.unique_invitees
+  entrypoint affiliation_tree() = state.affiliation_tree
+  entrypoint invitation_codes() = state.invitation_codes
+  entrypoint get_state() = state
+
+  payable stateful entrypoint register_invitation_code(invitation_address: address, redemption_fee_cover: int, invitation_amount: int) =
+    let minimum_redemption_fee_cover = 10 ^ 15 // minimal amount to cover redemption tx fees is ~2.01e14 (overpaid by few times to be sure)
+    require(redemption_fee_cover >= minimum_redemption_fee_cover, "MINIMUM_REDEMPTION_AND_FEE_NOT_MEET")
+    require(Call.value == redemption_fee_cover + invitation_amount, "INVITATION_AMOUNT_AND_FEE_NOT_MATCHING")
+    Chain.spend(invitation_address, redemption_fee_cover) // to cover fees paying for redemption
+    require(!Map.member(invitation_address, state.invitation_codes), "INVITATION_ALREADY_REGISTERED")
+    put(state{ invitation_codes[invitation_address] = (Call.caller, Call.value - redemption_fee_cover, false) })
+    Chain.event(InvitationRegistered(Call.caller, invitation_address, Call.value - redemption_fee_cover))
+
+  stateful entrypoint revoke_invitation_code(invitation_address: address) =
+    switch(Map.lookup(invitation_address, state.invitation_codes))
+      None => abort("INVITATION_NOT_REGISTERED")
+      Some((inviter_address, invitation_amount, is_redeemed)) =>
+        require(!is_redeemed, "ALREADY_REDEEMED")
+        require(Call.caller == inviter_address, "CALLER_NOT_INVITER")
+        Chain.spend(Call.caller, invitation_amount)
+        Chain.event(InvitationRevoked(invitation_address, inviter_address))
+        put(state{ invitation_codes = Map.delete(invitation_address, state.invitation_codes) })
+
+  stateful entrypoint redeem_invitation_code(invitee_address: address) =
+    switch(Map.lookup(Call.caller, state.invitation_codes))
+      None => abort("INVITATION_NOT_REGISTERED")
+      Some((inviter_address, invitation_amount, is_redeemed)) =>
+        require(!is_redeemed, "ALREADY_REDEEMED")
+        require(inviter_address != invitee_address, "INVITER_EQUAL_INVITEE")
+        put(state{ invitation_codes[Call.caller] = (inviter_address, invitation_amount, true) })
+        Chain.event(InvitationRedeemed(invitee_address, inviter_address, Call.caller))
+        Chain.spend(invitee_address, invitation_amount)
+        require(!Map.member(invitee_address, state.affiliation_tree), "INVITEE_ALREADY_REGISTERED")
+        put(state { affiliation_tree[invitee_address] = inviter_address })
+
+  stateful entrypoint register_invitation(inviter_address: address) =
+    require(!Map.member(Call.caller, state.affiliation_tree), "INVITEE_ALREADY_REGISTERED")
+    put(state { affiliation_tree[Call.caller] = inviter_address })
+    Chain.event(UserInvited(Call.caller, inviter_address))
+
+  // this is not intended to return overpaid, the check for >= value is to avoid unintended abortion
+  // this is not intended for external use, there is no harm from calling it publicly (i.e. donating to the invitation system)
+  // intended use is only via the buy function in token sale contracts
+  payable stateful entrypoint record_sale_transaction(buyer: address, transaction_value: int) =
+    let required_fee = (get_affiliation_fee_percentage() * transaction_value) / affiliation_fee_precision
+    require(Call.value >= required_fee, "AMOUNT_IS_NOT_EQUAL_TO_THE_AFFILIATION_PERCENTAGE")
+    update_inviters(buyer, buyer, transaction_value, affiliation_fee_percentages)
+    update_unique_invitees(buyer, transaction_value)
+    Chain.event(RecordSaleTransaction(buyer, transaction_value))
+
+  stateful function
+    update_inviters : (address, address, int, list(int)) => unit
+    update_inviters(_, _, _, []) = ()
+    update_inviters(invitee, buyer, transaction_value, affiliation_percentage :: remaining_affiliation_fee_percentages) =
+      switch(get_direct_inviter(invitee))
+        None => ()
+        Some(inviter) =>
+          update_inviter_balance(inviter, (transaction_value * affiliation_percentage) / affiliation_fee_precision)
+          update_inviters(inviter, buyer, transaction_value, remaining_affiliation_fee_percentages)
+
+  // find month id for current timestamp
+  entrypoint get_payout_period() : int =
+    Chain.timestamp / payout_period_interval
+
+  stateful function update_inviter_balance(inviter: address, reward: int) =
+    put(state { payout_periods[get_payout_period() = {}] @ payout_period = payout_period{ [inviter = 0] @ current_reward = current_reward + reward }})
+    Chain.event(RewardAdded(inviter, reward))
+
+  stateful function update_unique_invitees(buyer: address, transaction_value: int) =
+    switch(get_direct_inviter(buyer))
+      None => ()
+      Some(inviter) =>
+        switch(state.unique_invitees[inviter = WaitingForInvitations(Set.new(), {})])
+          ThresholdReached => ()
+          WaitingForInvitations(amount_reached_invitees, amount_wating_invitees) =>
+            if(Set.member(buyer, amount_reached_invitees))
+              ()
+            else
+              put(state{ unique_invitees[inviter] = new_invitees_state(buyer, transaction_value, amount_reached_invitees, amount_wating_invitees) })
+
+  function new_invitees_state(buyer: address, transaction_value: int, amount_reached_invitees: Set.set(address), amount_wating_invitees: map(address, int)) =
+    let new_amount_waiting = amount_wating_invitees[buyer = 0] + transaction_value
+    if(new_amount_waiting >= unique_invitee_buy_amount_threshold)
+      if(Set.size(amount_reached_invitees) >= (unique_invitee_count_threshold - 1))
+        // CASE: this buy will make so the threshold is reached
+        ThresholdReached
+      else
+        // CASE: this buy will only update the buyer from having the buy amount threshold reached
+        WaitingForInvitations(Set.insert(buyer, amount_reached_invitees), Map.delete(buyer, amount_wating_invitees))
+    else
+      // CASE: this buy will only increment the buyer buy amount
+      WaitingForInvitations(amount_reached_invitees, amount_wating_invitees{ [buyer] = new_amount_waiting })
+
+  // reward that hasn't or couldn't been withdrawn in the respecive periods can never be withdrawn again, thus be considered burned
+  stateful entrypoint withdraw() =
+    require(state.unique_invitees[Call.caller = WaitingForInvitations(Set.new(), {})] == ThresholdReached, "MINIMUM_ACCOUNTS_THRESHOLD_NOT_REACHED")
+
+    let reward = get_accumulated_rewards(Call.caller)
+    Chain.spend(Call.caller, reward)
+
+    put(state { payout_periods[get_payout_period() = {}] @ payout_period = payout_period{ [Call.caller]  = 0 }})
+    put(state { payout_periods[get_payout_period() - 1 = {}] @ payout_period = payout_period{ [Call.caller]  = 0 }})
+    Chain.event(Withdrawn(Call.caller, reward))

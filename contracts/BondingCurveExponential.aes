@@ -1,0 +1,96 @@
+// ISC License
+//
+// Copyright (c) 2024, BCTSL
+//
+// Permission to use, copy, modify, and/or distribute this software for any
+// purpose with or without fee is hereby granted, provided that the above
+// copyright notice and this permission notice appear in all copies.
+//
+// THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+// REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
+// AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+// INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
+// LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE
+// OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+// PERFORMANCE OF THIS SOFTWARE.
+
+// THIS IS NOT SECURITY AUDITED
+// DO NEVER USE THIS WITHOUT SECURITY AUDIT FIRST
+
+// Under no circumstances, whether in tort (including negligence), contract, or otherwise,
+// unless required by applicable law, shall BCTSL be liable for damages,
+// including any direct, indirect, special, incidental,
+// or consequential damages of any nature arising out of the deployment or use of this smart contract,
+// notwithstanding that BCTSL may have been advised of the possibility of such damages.
+
+@compiler >= 7
+
+include "./interfaces/BondingCurve.aes"
+
+contract BondingCurveExponential : BondingCurve =
+
+  // f(x)=e^(0.00000000002*x)-0.9999999999
+  let k : int = 2 * 10 ^ 7
+  let initial_price : int = 1 * 10 ^ 8
+  let decimals : int = 1 * 10 ^ 18
+  let minimum_count : int = 1 * 10 ^ 12
+  let sell_return_percentage : int = 9950 // 9950 is the representation for 99.50% percent
+  let sell_return_precision : int = 10000 // sell_return_percentage 10000 is matching buy price, 5000 is considered half of buy price
+
+  entrypoint get_k() = k
+  entrypoint get_initial_price() = initial_price
+  entrypoint get_minimum_count() = minimum_count
+  entrypoint get_sell_return_percentage() = sell_return_percentage
+  entrypoint get_sell_return_precision() = sell_return_percentage
+  entrypoint curve_type() : string = "TAYLOR_EXPONENTIAL_V1"
+  entrypoint supported_decimals() : int = 18
+
+  // returns the current buy price
+  entrypoint buy_price(total_supply : int) : int =
+    Frac.ceil(buy_curve(total_supply))
+
+  // returns the current sell price
+  entrypoint sell_price(total_supply : int) : int =
+    Frac.floor(sell_curve(total_supply))
+
+  function calculate_price(total_supply : int, count : int) =
+    require(count >= minimum_count, "MINIMUM_TOKENS_REQUIRED")
+    let current_supply_x = total_supply
+    let next_supply_x = total_supply + count
+
+    let current_supply_exponent = (k * current_supply_x)
+    let next_supply_exponent = (k * next_supply_x)
+
+    (initial_price * count) / decimals + (mc2(next_supply_exponent) - mc2(current_supply_exponent)) / k
+
+  // calculate the price in aettos for amount of tokens to be bought based on the total supply of the corresponding fungible token
+  entrypoint calculate_buy_price(total_supply : int, count : int) : int =
+    calculate_price(total_supply, count)
+
+  // returns the amount of aettos to be received when selling fungible tokens back to the curve
+  entrypoint calculate_sell_return(total_supply : int, sell_tokens : int) : int =
+    let price = calculate_price(total_supply - sell_tokens, sell_tokens)
+    (price * sell_return_percentage) / sell_return_precision
+
+  // McLaurin expansion of e^x starting at the quadratic term
+  function mc2(x : int) =
+    exp_helper(x, x, 0, 2, decimals * decimals)
+
+  // Recursive function to calculate e^x using a Taylor series approximation
+  function exp_helper(x : int, term : int, sum : int, i : int, scale : int) : int =
+    if (i > 100 || term < 1)
+      sum
+    else
+      let next_term = (term * x) / (i * scale)  // x^i / i!
+      exp_helper(x, next_term, sum + next_term, i + 1, scale)
+
+  entrypoint buy_curve(x : int) : Frac.frac =
+    // Calculate the exponent parts scaled to avoid precision loss
+    let x_exponent = (k * x) / decimals
+
+    // Calculate e^(kx) using the exp function
+    let y = exp_helper(x_exponent, decimals, decimals, 1, decimals)
+    Frac.add(Frac.make_frac(y - decimals, decimals), Frac.make_frac(initial_price, decimals))
+
+  entrypoint sell_curve(x : int) : Frac.frac =
+    Frac.mul(buy_curve(x), Frac.make_frac(sell_return_percentage, sell_return_precision))

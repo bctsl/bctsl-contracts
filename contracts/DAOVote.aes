@@ -1,0 +1,142 @@
+// ISC License
+//
+// Copyright (c) 2024, BCTSL
+//
+// Permission to use, copy, modify, and/or distribute this software for any
+// purpose with or without fee is hereby granted, provided that the above
+// copyright notice and this permission notice appear in all copies.
+//
+// THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+// REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
+// AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+// INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
+// LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE
+// OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+// PERFORMANCE OF THIS SOFTWARE.
+
+// THIS IS NOT SECURITY AUDITED
+// DO NEVER USE THIS WITHOUT SECURITY AUDIT FIRST
+
+// Under no circumstances, whether in tort (including negligence), contract, or otherwise,
+// unless required by applicable law, shall BCTSL be liable for damages,
+// including any direct, indirect, special, incidental,
+// or consequential damages of any nature arising out of the deployment or use of this smart contract,
+// notwithstanding that BCTSL may have been advised of the possibility of such damages.
+
+@compiler >= 7
+
+include "../node_modules/aeternity-fungible-token/contracts/fungible-token-full.aes"
+
+include "String.aes"
+
+namespace VoteSubjects =
+  datatype subject =
+      VotePayout(address)
+    | VotePayoutAmount(address, int)
+    | ChangeDAO(address)
+    | ChangeMetaInfo(map(string, string))
+    | ChangeMinimumTokenThreshold(int)
+    | AddModerator(address)
+    | DeleteModerator(address)
+
+contract DAOVote =
+
+  type vote_option = bool
+  type amount = int
+
+  // vote option to staked amount
+  type vote_state = map(vote_option, amount)
+
+  // voter account to staked amount, option and withdrawn state
+  type vote_accounts = map(address, (amount * vote_option * bool))
+
+
+  record metadata =
+    { subject : VoteSubjects.subject
+    , description : string
+    , link : string }
+
+  record state =
+    { metadata : metadata
+    , close_height : int
+    , create_height : int
+    , vote_state : vote_state
+    , vote_accounts : vote_accounts
+    , token : FungibleTokenFull
+    , author : address }
+
+  datatype event = Vote(address, vote_option, amount)
+                 | RevokeVote(address, vote_option, amount)
+                 | Withdraw(address, amount)
+
+  entrypoint init(metadata : metadata, token : FungibleTokenFull, author : address) : state =
+    require(String.length(metadata.description) =< 300, "DESCRIPTION_STRING_TOO_LONG")
+    { metadata = metadata,
+      close_height = Chain.block_height + (60 / 3) * 24 * 7 * 2, // 2 weeks: (60 / 3) is one hour in key block time, 24h in day for 7 days in 2 weeks
+      create_height = Chain.block_height,
+      vote_state = { [true] = 0, [false] = 0 },
+      vote_accounts = {},
+      token = token,
+      author = author }
+
+  // STATEFUL FUNCTIONS
+
+  // transfer allowance to vote contract, to lock tokens, keep track of state and account
+  stateful entrypoint vote(option : vote_option, amount : amount) =
+    require(!is_closed(), "VOTE_ALREADY_CLOSED")
+    require(!Map.member(Call.caller, state.vote_accounts), "VOTER_ALREADY_VOTED")
+    state.token.transfer_allowance(Call.caller, Contract.address, amount)
+    Chain.event(Vote(Call.caller, option, amount))
+    put(state{ vote_state[option] @ prev_amount = prev_amount + amount, vote_accounts[Call.caller] = (amount, option, false)})
+
+  // transfer tokens to voter keep track of state and account
+  stateful entrypoint revoke_vote() =
+    require(!is_closed(), "VOTE_ALREADY_CLOSED")
+    require(Map.member(Call.caller, state.vote_accounts), "VOTER_NOT_VOTED")
+    let (amount, option, _) = state.vote_accounts[Call.caller]
+    state.token.transfer(Call.caller, amount)
+    Chain.event(RevokeVote(Call.caller, option, amount))
+    put(state{ vote_accounts = Map.delete(Call.caller, state.vote_accounts), vote_state[option] @ prev_amount = prev_amount - amount })
+
+  // withdraw tokens if vote is closed, keep track of withdrawn status for account
+  stateful entrypoint withdraw() =
+    require(is_closed(), "VOTE_NOT_CLOSED")
+    require(Map.member(Call.caller, state.vote_accounts), "VOTER_NOT_VOTED")
+    let (amount, option, withdrawn) = state.vote_accounts[Call.caller]
+    require(!withdrawn, "AMOUNT_ALREADY_WITHDRAWN")
+    Chain.event(Withdraw(Call.caller, amount))
+    put(state{ vote_accounts[Call.caller] = (amount, option, true) })
+    state.token.transfer(Call.caller, amount)
+
+  // STATELESS GETTER FUNCTIONS
+
+  entrypoint get_state() : state = state
+  entrypoint close_height() : int = state.close_height
+  entrypoint metadata() : metadata = state.metadata
+  entrypoint subject() : VoteSubjects.subject = state.metadata.subject
+  entrypoint token() : FungibleTokenFull = state.token
+  entrypoint vote_accounts() : vote_accounts = state.vote_accounts
+  entrypoint current_vote_state() : vote_state = state.vote_state
+  entrypoint has_voted(voter : address) : bool = Map.member(voter, state.vote_accounts)
+  entrypoint is_closed() : bool = Chain.block_height >= state.close_height
+  entrypoint version() : int = 1
+
+  entrypoint has_withdrawn(voter : address) : option(bool) =
+   if(Map.member(voter, state.vote_accounts))
+     let (_, _, withdrawn) = state.vote_accounts[voter]
+     Some(withdrawn)
+   else
+     None
+
+  entrypoint final_vote_state() : option(vote_state) =
+    if(is_closed())
+      Some(state.vote_state)
+    else
+      None
+
+  entrypoint voted_option(voter : address) : option(vote_option) =
+   if(Map.member(voter, state.vote_accounts))
+     let (_, option, _) = state.vote_accounts[voter]
+     Some(option)
+   else
+     None

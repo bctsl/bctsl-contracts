@@ -1,0 +1,155 @@
+// ISC License
+//
+// Copyright (c) 2024, BCTSL
+//
+// Permission to use, copy, modify, and/or distribute this software for any
+// purpose with or without fee is hereby granted, provided that the above
+// copyright notice and this permission notice appear in all copies.
+//
+// THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+// REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
+// AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+// INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
+// LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE
+// OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+// PERFORMANCE OF THIS SOFTWARE.
+
+// THIS IS NOT SECURITY AUDITED
+// DO NEVER USE THIS WITHOUT SECURITY AUDIT FIRST
+
+// Under no circumstances, whether in tort (including negligence), contract, or otherwise,
+// unless required by applicable law, shall BCTSL be liable for damages,
+// including any direct, indirect, special, incidental,
+// or consequential damages of any nature arising out of the deployment or use of this smart contract,
+// notwithstanding that BCTSL may have been advised of the possibility of such damages.
+
+@compiler >= 7
+
+include "./interfaces/TokenSale.aes"
+include "./interfaces/BondingCurve.aes"
+include "./interfaces/ReplaceableDAO.aes"
+
+include "./AffiliationTreasury.aes"
+
+include "Option.aes"
+
+contract interface ICommunityFactory =
+  entrypoint mint_protocol_dao_token : (int, address) => unit
+
+contract AffiliationBondingCurveTokenSale : TokenSale =
+
+  datatype event = Buy(int, int, int) // total_price, affiliation_amount, total_supply (count can be read from call args)
+                 | Sell(int, int) // return, total_supply (count can be read from call args)
+                 | PriceChange(int, int) // previous_price, next_price (count can be read from call args)
+
+  record state =
+    { token_contract : FungibleTokenFull,
+      bonding_curve : BondingCurve,
+      affiliation_treasury : AffiliationTreasury,
+      owner : address,
+      factory : ICommunityFactory,
+      beneficiary : address,
+      dao_contract : ReplaceableDAO }
+
+  stateful entrypoint init(beneficiary : address, name : string, decimals : int, symbol : string, bonding_curve : BondingCurve, overwrite_owner : option(address), affiliation_treasury : AffiliationTreasury) : state =
+    let dao_contract = verify_dao(beneficiary)
+    require(decimals == bonding_curve.supported_decimals(), "BONDING_CURVE_SUPPORTED_DECIMALS_MISSMATCH")
+    { token_contract = Chain.create(name, decimals, symbol, None) : FungibleTokenFull,
+      bonding_curve = bonding_curve,
+      affiliation_treasury = affiliation_treasury,
+      owner = Option.default(Call.caller, overwrite_owner),
+      factory = Address.to_contract(Call.caller) : ICommunityFactory, // doesn't verify that this is a real community factory, but shouldn't matter in the community factory use-case
+      beneficiary = beneficiary,
+      dao_contract = dao_contract }
+
+  entrypoint get_state() : state = state
+  entrypoint token_contract() : FungibleTokenFull = state.token_contract
+  entrypoint owner() : address = state.owner
+  entrypoint beneficiary() : address = state.beneficiary
+  entrypoint bonding_curve() : BondingCurve = state.bonding_curve
+  entrypoint sale_type() : string = "AFFILIATION_BONDING_CURVE"
+  entrypoint version() : int = 1
+
+  // require positive count shouldn't be needed as Call.value in price can't be < 0
+  entrypoint price(count : int) : int =
+    require(count > 0, "COUNT_NOT_POSITIVE")
+    let bonding_curve_price = state.bonding_curve.calculate_buy_price(state.token_contract.total_supply(), count)
+    let affiliation_amount = affiliation_amount(bonding_curve_price)
+    bonding_curve_price + affiliation_amount
+
+  entrypoint sell_return(count : int) : int =
+    require(count > 0, "COUNT_NOT_POSITIVE")
+    state.bonding_curve.calculate_sell_return(state.token_contract.total_supply(), count)
+
+  function affiliation_amount(bonding_curve_price : int) =
+    let affiliation_percentage = state.affiliation_treasury.get_affiliation_fee_percentage()
+    (bonding_curve_price * affiliation_percentage) / state.affiliation_treasury.get_affiliation_fee_precision()
+
+  // aettos to base decimal
+  payable stateful entrypoint buy(count : int) : unit = buy_with_affiliation_inner(count, Call.caller)
+
+  payable stateful entrypoint buy_with_affiliation(count : int, affiliation_rewardee: address): unit =
+    require(Call.caller == state.factory.address, "ONLY_FACTORY_CAN_CALL")
+    buy_with_affiliation_inner(count, affiliation_rewardee)
+
+  stateful function buy_with_affiliation_inner(count : int, affiliation_rewardee: address) : unit =
+    require(count > 0, "COUNT_NOT_POSITIVE")
+    let total_supply = state.token_contract.total_supply()
+    let bonding_curve_price = state.bonding_curve.calculate_buy_price(total_supply, count)
+    let previous_price = calculate_unit_price()
+
+    let affiliation_amount = affiliation_amount(bonding_curve_price)
+    let total_price = bonding_curve_price + affiliation_amount
+
+    require(Call.value >= total_price, "AE_AMOUNT_NOT_SUFFICIENT")
+    state.affiliation_treasury.record_sale_transaction(value = affiliation_amount, protected = true, affiliation_rewardee, bonding_curve_price)
+
+    let overpaid_refund = Call.value - total_price
+    if (overpaid_refund > 0) Chain.spend(Call.caller, overpaid_refund) else ()
+    state.token_contract.mint(Call.caller, count)
+    // issue protocol DAO tokens to the buyer. these tokens can be staked to participate in future signaling polls.
+    if (Call.caller != state.factory.address) state.factory.mint_protocol_dao_token(Call.value - overpaid_refund, Call.caller) else () // check to avoid reentrancy in initial buy
+    let reserve = state.bonding_curve.calculate_sell_return(state.token_contract.total_supply(), count)
+    // protected = true to not block sale if something isn't right with dao
+    state.dao_contract.record_sale_transaction(value = Call.value - overpaid_refund - affiliation_amount - reserve, protected = true, Call.caller, total_price)
+    let next_price = calculate_unit_price()
+    Chain.event(PriceChange(previous_price, next_price))
+    Chain.event(Buy(total_price, affiliation_amount, total_supply))
+
+  stateful entrypoint sell(count : int, minimal_return_required : int) : int =
+    let total_supply = state.token_contract.total_supply()
+    let previous_price = calculate_unit_price()
+    let return = state.bonding_curve.calculate_sell_return(total_supply, count)
+    require(return >= minimal_return_required, "MINIMAL_RETURN_NOT_MEET")
+    state.token_contract.transfer_allowance(Call.caller, Contract.address, count)
+    state.token_contract.burn(count)
+    Chain.spend(Call.caller, return)
+    let next_price = calculate_unit_price()
+    Chain.event(PriceChange(previous_price, next_price))
+    Chain.event(Sell(return, total_supply))
+    return
+
+  stateful entrypoint set_beneficiary(beneficiary : address) : unit =
+    require_owner()
+    let dao_contract = verify_dao(beneficiary)
+    put(state{ beneficiary = beneficiary,
+               dao_contract = dao_contract })
+
+  stateful entrypoint set_owner(owner : address) : unit =
+    require_owner()
+    put(state{ owner = owner })
+
+  function require_owner() : unit =
+    require(Call.caller == state.owner, "UNAUTHORIZED")
+
+  function verify_dao(beneficiary : address) : ReplaceableDAO =
+    let dao_contract = Address.to_contract(beneficiary) : ReplaceableDAO
+    // the goal here is to verify if this endpoint exists and is payable for future use to not fail
+    // value = 0 doesn't actually check if entrypoint is payable, currently there isn't a way to do this in sophia
+    // https://github.com/aeternity/aesophia/issues/508
+    dao_contract.record_sale_transaction(value = 0, ak_11111111111111111111111111111111273Yts, 0)
+    dao_contract
+
+  function calculate_unit_price() : int =
+    let count = 1 * 10 ^ state.bonding_curve.supported_decimals()
+    price(count)

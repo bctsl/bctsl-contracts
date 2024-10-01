@@ -1,0 +1,154 @@
+// ISC License
+//
+// Copyright (c) 2024, BCTSL
+//
+// Permission to use, copy, modify, and/or distribute this software for any
+// purpose with or without fee is hereby granted, provided that the above
+// copyright notice and this permission notice appear in all copies.
+//
+// THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+// REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
+// AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+// INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
+// LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE
+// OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+// PERFORMANCE OF THIS SOFTWARE.
+
+// THIS IS NOT SECURITY AUDITED
+// DO NEVER USE THIS WITHOUT SECURITY AUDIT FIRST
+
+// Under no circumstances, whether in tort (including negligence), contract, or otherwise,
+// unless required by applicable law, shall BCTSL be liable for damages,
+// including any direct, indirect, special, incidental,
+// or consequential damages of any nature arising out of the deployment or use of this smart contract,
+// notwithstanding that BCTSL may have been advised of the possibility of such damages.
+
+@compiler >= 7
+
+include "./interfaces/TokenSale.aes"
+include "./interfaces/ReplaceableDAO.aes"
+
+include "./DAOVote.aes"
+include "./CommunityManagement.aes"
+
+include "Option.aes"
+
+contract interface Factory =
+  entrypoint get_community_management : (TokenSale) => CommunityManagement
+
+payable contract DAO : ReplaceableDAO =
+
+  type votes = map(int, (bool * DAOVote))
+
+  datatype event = VoteAdded(DAOVote, int)
+                 | AppliedVoteSubject(DAOVote, int)
+
+  record state =
+    { token_sale : option(TokenSale)
+    , votes : votes
+    , vote_timeout : int
+    , factory : Factory }
+
+  stateful entrypoint init(token_sale : option(TokenSale), factory_address : address) =
+    { token_sale = token_sale,
+      votes = {},
+      vote_timeout = (60 / 3) * 24 * 2, // 2 days: (60 / 3) is one hour in key block time, 24h in day for 2 days
+      factory = Address.to_contract(factory_address) : Factory }
+
+  entrypoint get_token() = get_token_sale().token_contract()
+  entrypoint votes() : votes = state.votes
+  entrypoint vote_timeout() : int = state.vote_timeout
+  entrypoint factory() : Factory = state.factory
+  entrypoint get_state() : state = state
+  entrypoint get_token_sale() =
+    switch(state.token_sale)
+      Some(token_sale) => token_sale
+      None => abort("TOKEN_SALE_NOT_SET")
+
+  payable stateful entrypoint record_sale_transaction(buyer : address, buy_price : int) = ()
+
+  entrypoint get_community_management() : option(CommunityManagement)  =
+    Some(state.factory.get_community_management(get_token_sale()))
+
+  // just a safeguard against mistakes, can be used by any contract ofc
+  entrypoint is_dao() : bool = true
+  entrypoint version() : int = 1
+
+  // can only be called once, is called by the factory in the same transaction as deployment to avoid the sale <-> dao creation chicken-egg-problem
+  stateful entrypoint set_token_sale(token_sale : TokenSale) =
+    require(Call.caller == Contract.creator, "ONLY_CREATOR_CAN_SET_SALE")
+    require(Option.is_none(state.token_sale), "TOKEN_SALE_ALREADY_SET")
+    put(state{ token_sale = Some(token_sale) })
+
+  payable stateful entrypoint add_vote(metadata : DAOVote.metadata) =
+    require(Call.value == 555 * (10 ^ 18), "ADD_VOTE_DAO_DONATION_MISSMATCH")
+    let token = get_token()
+    let minimum_token_threshold =  switch(get_community_management())
+      None => abort("NO_COMMUNITY_MANAGEMENT_AVAILABLE")
+      Some(community_management) => community_management.minimum_token_threshold()
+    require(Option.default(0, token.balance(Call.caller)) >= minimum_token_threshold, "ADD_VOTE_TOKEN_HOLDER_MISSMATCH")
+
+    let vote = Chain.create(metadata, token, Call.caller) : DAOVote
+    let vote_seq_id = Map.size(state.votes)
+    Chain.event(VoteAdded(vote, vote_seq_id))
+    put(state{ votes[vote_seq_id] = (false, vote) })
+    (vote_seq_id, vote)
+
+  stateful entrypoint apply_vote_subject(vote_seq_id : int) =
+    let (applied, vote) = state.votes[vote_seq_id]
+    require(!applied, "VOTE_ALREADY_APPLIED")
+    require(vote.close_height() + state.vote_timeout >= Chain.block_height, "VOTE_RESULT_TIMEOUTED")
+
+    switch(vote.final_vote_state())
+      None => abort("VOTE_NOT_YET_FINAL")
+      Some(vote_state) =>
+        let total_vote_stake = vote_state[true] + vote_state[false]
+        require(total_vote_stake > 0, "NO_VOTE_STAKE")
+
+        let token_total_supply = get_token().total_supply()
+        require(token_total_supply > 0, "NO_TOKEN_SUPPLY")
+
+        let in_favor_percentage = (vote_state[true] * 100) / total_vote_stake
+        require(in_favor_percentage >= 55, "GREATER_55_PERCENT_AGREEMENT_REQUIRED")
+
+        // the total token supply can change after the vote has closed, thus impacting this check, therefore we keep the application timeout short to minimize the security impact
+        let stake_percentage = (total_vote_stake * 100) / token_total_supply
+        require(stake_percentage >= 10, "GREATER_10_PERCENT_STAKE_REQUIRED")
+
+        switch(vote.subject())
+          VoteSubjects.VotePayout(receiver) => Chain.spend(receiver, Contract.balance)
+
+          VoteSubjects.VotePayoutAmount(receiver, amount) => Chain.spend(receiver, amount)
+
+          VoteSubjects.ChangeDAO(new_dao_address) =>
+              let new_dao = Address.to_contract(new_dao_address) : ReplaceableDAO
+
+              // expects to just abort if not correct dao is passed with invalid contract
+              require(new_dao.is_dao(), "NEW_DAO_INVALID")
+              Chain.spend(new_dao_address, Contract.balance)
+              get_token_sale().set_beneficiary(new_dao_address) // payability is checked in the token sale contract
+              get_token_sale().set_owner(new_dao_address)
+
+              // of course a custom dao can change this afterwards, just a check to not change everything initially
+              require(get_community_management() == new_dao.get_community_management(), "NEW_DAO_HAS_TO_REFERENCE_SAME_COMMUNITY_MANAGEMENT")
+              call_community_management((community_management) => community_management.set_owner(new_dao_address))
+
+          VoteSubjects.ChangeMinimumTokenThreshold(new_amount) =>
+            call_community_management((community_management) => community_management.change_minimum_token_threshold(new_amount))
+
+          VoteSubjects.AddModerator(moderator) =>
+            call_community_management((community_management) => community_management.add_moderator(moderator))
+
+          VoteSubjects.DeleteModerator(moderator) =>
+            call_community_management((community_management) => community_management.delete_moderator(moderator))
+
+          VoteSubjects.ChangeMetaInfo(meta_info) =>
+            call_community_management((community_management) => community_management.change_meta_info(meta_info))
+
+        Chain.event(AppliedVoteSubject(vote, vote_seq_id))
+        put(state{ votes[vote_seq_id] = (true, vote) })
+
+  function call_community_management(call : (CommunityManagement => unit))  =
+    switch(get_community_management())
+      None => abort("NO_COMMUNITY_MANAGEMENT_AVAILABLE")
+      Some(community_management) => call(community_management)

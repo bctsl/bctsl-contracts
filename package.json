@@ -1,0 +1,25 @@
+{
+  "name": "bctsl-contracts",
+  "version": "1.0.0",
+  "description": "Bonding curve token sale launchpad contracts",
+  "scripts": {
+    "test": "mocha ./test/**/*.js --timeout 0 --exit",
+    "postinstall": "node .scripts/postinstall.js",
+    "generate-bytecode-aci-hashes": "node .scripts/generate-bytecode-aci-hashes.js",
+    "prepublishOnly": "npm run generate-bytecode-aci-hashes",
+    "testBondingCurve": "mocha test/tryBondingCurveConfigurations.js"
+  },
+  "dependencies": {
+    "@aeternity/aepp-sdk": "^13.3.3",
+    "aeternity-fungible-token": "git+https://git@github.com/aeternity/aeternity-fungible-token#v2.2.0",
+    "bignumber.js": "^9.1.2"
+  },
+  "devDependencies": {
+    "@aeternity/aeproject": "^4.10.2",
+    "libqalculate-wasm": "file:./libqalculate-wasm-0.0.6.tgz",
+    "chai": "^4.5.0",
+    "chai-as-promised": "^7.1.2",
+    "mocha": "^10.7.3",
+    "prettier": "^3.3.3"
+  }
+}
